@@ -196,7 +196,7 @@ static int compute(const uint8_t *body, uint32_t body_len,
     size_t rows_bytes = (size_t)heads * q_rows * d * 4;
     size_t kv_bytes = 2ull * heads * n_ctx * d * 4;
     size_t q_bytes = rows_bytes;
-    size_t pos_bytes = (size_t)n_hkvd * 4;
+    size_t pos_bytes = (size_t)n_hkvd * 8;
     size_t mask_bytes = (size_t)q_rows * n_total;
     size_t off = 28;
     const uint8_t *pre = body + off; off += kv_bytes;
@@ -209,14 +209,14 @@ static int compute(const uint8_t *body, uint32_t body_len,
     }
 
     int (*cuMemAlloc)(void **, unsigned long long) =
-        dlsym(libcuda, "cuMemAlloc");
-    int (*cuMemFree)(void *) = dlsym(libcuda, "cuMemFree");
+        dlsym(libcuda, "cuMemAlloc_v2");
+    int (*cuMemFree)(void *) = dlsym(libcuda, "cuMemFree_v2");
     int (*cuMemcpyHtoD)(void *, const void *, unsigned long long,
                         unsigned long long, void *) =
-        dlsym(libcuda, "cuMemcpyHtoDAsync");
+        dlsym(libcuda, "cuMemcpyHtoDAsync_v2");
     int (*cuMemcpyDtoH)(void *, const void *, unsigned long long,
                         unsigned long long, void *) =
-        dlsym(libcuda, "cuMemcpyDtoHAsync");
+        dlsym(libcuda, "cuMemcpyDtoHAsync_v2");
     int (*cuStreamSync)(void *) = dlsym(libcuda, "cuStreamSynchronize");
     if (!cuMemAlloc || !cuMemFree || !cuMemcpyHtoD || !cuMemcpyDtoH ||
         !cuStreamSync) {
@@ -238,8 +238,8 @@ static int compute(const uint8_t *body, uint32_t body_len,
         cuMemAlloc(&d_q, q_bytes) ||
         cuMemAlloc(&d_pos, pos_bytes) ||
         cuMemAlloc(&d_mask, mask_bytes) ||
-        cuMemAlloc(&d_km, rows_bytes) ||
-        cuMemAlloc(&d_vm, rows_bytes) ||
+        cuMemAlloc(&d_km, (unsigned long long)heads * n_total * d * 4) ||
+        cuMemAlloc(&d_vm, (unsigned long long)heads * n_total * d * 4) ||
         cuMemAlloc(&d_scores,
                    (unsigned long long)heads * q_rows * n_total * 4) ||
         cuMemAlloc(&d_probs,
@@ -273,42 +273,36 @@ static int compute(const uint8_t *body, uint32_t body_len,
         void *o2 = d_vm;
         void *pv[] = {&a2, &b2, &d_pos, &o2, &ctx_i, &hkvd, &nqq,
                       &heads, &d};
-        fprintf(stderr, "gpu-server: filter launches\n");
         if (launch1(fn_filter_merge, "filter_k", pk, blocks) ||
             launch1(fn_filter_merge, "filter_v", pv, blocks)) {
-            fprintf(stderr, "gpu-server: filter launch failed\n");
             goto fail;
         }
     }
     {
         int tb = 1;
         int ctx_i = (int)n_ctx;
+        int total_i = (int)n_total;
         int qr = q_rows;
         unsigned long long sn =
             ((unsigned long long)heads * q_rows * n_total + 255) / 256;
         void *ps[] = {&d_q, &d_km, &d_scores, &heads, &qr, &d,
-                      &ctx_i, &tb, &scale};
-        fprintf(stderr, "gpu-server: scores launch\n");
+                      &total_i, &tb, &scale};
         if (launch1(fn_matmul, "scores", ps, sn)) {
-            fprintf(stderr, "gpu-server: scores launch failed\n");
             goto fail;
         }
-        void *pm[] = {&d_scores, &d_mask, &d_probs, &heads, &qr, &ctx_i};
+        void *pm[] = {&d_scores, &d_mask, &d_probs, &heads, &qr, &total_i};
         unsigned long long sm =
             ((unsigned long long)heads * q_rows + 255) / 256;
-        fprintf(stderr, "gpu-server: softmax launch\n");
         if (launch1(fn_softmax, "softmax", pm, sm)) {
-            fprintf(stderr, "gpu-server: softmax launch failed\n");
             goto fail;
         }
         int tb0 = 0;
         unsigned long long on =
             ((unsigned long long)heads * q_rows * d + 255) / 256;
-        void *po[] = {&d_probs, &d_vm, &d_out, &heads, &qr, &d,
-                      &ctx_i, &tb0, &scale};
-        fprintf(stderr, "gpu-server: pv launch\n");
+        float pv_one = 1.0f;
+        void *po[] = {&d_probs, &d_vm, &d_out, &heads, &qr, &total_i,
+                      &d, &tb0, &pv_one};
         if (launch1(fn_matmul, "ofinal", po, on)) {
-            fprintf(stderr, "gpu-server: pv launch failed\n");
             goto fail;
         }
     }
