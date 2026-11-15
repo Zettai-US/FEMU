@@ -26,21 +26,33 @@ uses the shipped `csd_args_shim.h`.
 
 ## Command contract
 
-`data_buffer` carries 13 packed 64-byte SIMT SSD MemoryRange
-descriptors in the `fused_attn_prefill` role order
-(K_PRE, V_PRE, K_APP, V_APP, Q, POS, MASK, K_MERGED, V_MERGED,
-SCORES, PROBS, O_PART, O_FINAL; see
-`lmcache/v1/distributed/l2_adapters/simtssd/programs/fused_attn.py`).
+The EXECUTE payload references ONE AFDM memory range (cparam1 = its
+index; the kernel NVMe passthrough cannot set the EXEC dlen/cdw4
+field, so descriptors cannot travel in the EXEC payload). The plugin
+resolves every descriptor as a byte offset from that range's base:
 
-- `cparam1`: index of the MRS range holding the KV store. KV blobs
-  are token-major (`[layers][2][heads][tokens][head_dim]`), cut into
-  16-token pages; `PAGE_INDIRECT` descriptors address them through a
-  u64 page-offset table appended to the same range (offsets relative
-  to the range base).
-- `cparam2`: the score scale `1/sqrt(d)` as float bits.
-- HOST_DMA/DEV_DRAM descriptors resolve to `mr_addr[descriptor
-  index]`; outputs (O_FINAL) are written in place (zero-copy from the
-  plugin's perspective).
+- The range holds, in order: the KV blob (token-major
+  `[layers][2][heads][tokens][head_dim]`, cut into 16-token pages),
+  the u64 page tables for K and V, the host staging regions
+  (K_APP/V_APP/Q/POS/MASK), and O_FINAL.
+- `cparam2`: byte offset of the 13 packed 64-byte MemoryRange
+  descriptors within the same range, in the `fused_attn_prefill` role
+  order (K_PRE, V_PRE, K_APP, V_APP, Q, POS, MASK, K_MERGED,
+  V_MERGED, SCORES, PROBS, O_PART, O_FINAL; see
+  `lmcache/v1/distributed/l2_adapters/simtssd/programs/fused_attn.py`).
+- The score scale is derived as `1/sqrt(head_dim)` from the
+  descriptors' geometry.
+
+`PAGE_INDIRECT` descriptors address pages through a u64 page-offset
+table appended to the same range (offsets relative to the range base).
+
+Driver-ABI note (bring-up finding): CUDA memory entry points must use
+the `_v2` symbols (`cuMemAlloc_v2`, `cuMemcpyHtoDAsync_v2`, ...) — the
+undecorated names bind to the legacy-context entry points and fail
+with `CUDA_ERROR_INVALID_CONTEXT` (the plugin's `dlsym2` handles
+this). Known bring-up item: cuInit inside the QEMU process currently
+faults on first contact; the plugin is cross-validated in-process by
+the LMCache reference test (test_simtssd_csd_plugin.py).
 
 The host side (LMCache `simtssd` L2 adapter) records the per-key page
 tables and issues the standard CSD/CP commands (COMPUTE LOAD /

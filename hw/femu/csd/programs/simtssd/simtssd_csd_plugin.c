@@ -11,12 +11,10 @@
  * hardware, NAND/channel timing in FEMU's SSD model.
  *
  * Command contract (v1):
- * - data_buffer: 13 packed 64-byte MemoryRange descriptors in the
- *   fused_attn_prefill role order (see
- *   lmcache/.../simtssd/programs/fused_attn.py).
- * - cparam1: index of the MRS range holding the KV store; PAGE_INDIRECT
- *   table offsets are relative to that range's base address.
- * - HOST_DMA / DEV_DRAM descriptors resolve to mr_addr[index].
+ * - With numr == 1 (the CSD path) every descriptor addresses the
+ *   single AFDM: addr fields are byte offsets from its base, and
+ *   cparam1 is that range's index (0). PAGE_INDIRECT table offsets are
+ *   relative to the same base.
  */
 
 #include <dlfcn.h>
@@ -171,6 +169,14 @@ static void cuda_lazy_init(void) {
     pthread_once(&g_once, cuda_once);
 }
 
+/* Initialize CUDA on the thread that loads the plugin (FEMU's admin
+ * poller, full stack) rather than lazily on a CSD compute worker: the
+ * NVRTC compile + module load are heavyweight. */
+__attribute__((constructor)) static void simtssd_plugin_ctor(void) {
+    cuda_lazy_init();
+}
+
+
 static int launch1(ssd_cuda_t *c, void *fn, void **params,
                    unsigned long long blocks) {
     pfn_culaunch cuLaunchKernel =
@@ -198,7 +204,8 @@ static int stage_in(ssd_cuda_t *c, pfn_cualloc cuMemAlloc,
 
 int64_t simtssd_fused_main(FemuCsdArgs *args) {
     cuda_lazy_init();
-    if (g_init_rc != 0 || args->numr < N_RANGES || !args->data_buffer) {
+    if (g_init_rc != 0) {
+        fprintf(stderr, "simtssd: cuda init failed (%d)\n", g_init_rc);
         return -1;
     }
     ssd_cuda_t *c = &g_cuda;
@@ -216,19 +223,20 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
         (int (*)(void *))dlsym(c->libcuda, "cuStreamSynchronize");
     if (!cuMemAlloc_ || !cuMemFree_ || !cuMemcpyHtoD_ || !cuMemcpyDtoH_ ||
         !cuStreamSync) {
+        fprintf(stderr, "simtssd: driver symbols missing\n");
         return -1;
     }
 
-    if ((size_t)args->buffer_len < N_RANGES * sizeof(ssd_range_t)) {
-        return -1;
-    }
-    ssd_range_t r[N_RANGES];
-    memcpy(r, args->data_buffer, sizeof(r));
     int kv_mr = (int)args->cparam1;
+    uint64_t desc_off = (uint64_t)args->cparam2;
     if (kv_mr < 0 || kv_mr >= args->numr || !args->mr_addr[kv_mr]) {
+        fprintf(stderr, "simtssd: bad kv_mr %d (numr=%d)\n", kv_mr,
+                args->numr);
         return -1;
     }
     uint8_t *kv_base = (uint8_t *)args->mr_addr[kv_mr];
+    ssd_range_t r[N_RANGES];
+    memcpy(r, kv_base + desc_off, sizeof(r));
 
     /* Gather the pre K/V pages (PAGE_INDIRECT into the KV MRS, or a
      * contiguous window when the flag is absent). */
@@ -259,6 +267,16 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
         } else {
             memcpy(buf, kv_base + rp->addr, len);
         }
+        {
+            float s = 0.0f;
+            for (unsigned long long j = 0; j < len / 4; j++) {
+                float f;
+                memcpy(&f, buf + j * 4, 4);
+                s += f;
+            }
+            fprintf(stderr, "simtssd: gathered %s checksum=%f\n",
+                    i == 0 ? "K" : "V", s);
+        }
         if (i == 0) {
             kbuf = buf;
         } else {
@@ -274,13 +292,7 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
     int n_q = n_app - n_hkvd;
     int total = n_ctx + n_q;
     int q_rows = n_hkvd + n_q;
-    /* The host sends the score scale (1/sqrt(d)) as float bits in
-     * cparam2. */
-    float scale = 0.0f;
-    memcpy(&scale, &args->cparam2, sizeof(scale));
-    if (scale <= 0.0f || scale > 1.0f) {
-        scale = 1.0f / sqrtf((float)d);
-    }
+    float scale = 1.0f / sqrtf((float)d);
 
     long long *pos64 =
         (long long *)malloc((size_t)n_hkvd * sizeof(long long));
@@ -290,7 +302,7 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
         return -1;
     }
     {
-        const int *p32 = (const int *)args->mr_addr[5];
+        const int *p32 = (const int *)(kv_base + r[5].addr);
         for (int i = 0; i < n_hkvd; i++) {
             pos64[i] = p32[i];
         }
@@ -314,15 +326,15 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
                  &d_pre_k) ||
         stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, vbuf, (uint64_t)r[1].length,
                  &d_pre_v) ||
-        stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, args->mr_addr[2],
+        stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, kv_base + r[2].addr,
                  r[2].length, &d_app_k) ||
-        stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, args->mr_addr[3],
+        stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, kv_base + r[3].addr,
                  r[3].length, &d_app_v) ||
-        stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, args->mr_addr[4],
+        stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, kv_base + r[4].addr,
                  r[4].length, &d_q) ||
         stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, pos64,
                  (uint64_t)n_hkvd * sizeof(long long), &d_pos) ||
-        stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, args->mr_addr[6],
+        stage_in(c, cuMemAlloc_, cuMemcpyHtoD_, kv_base + r[6].addr,
                  r[6].length, &d_mask) ||
         cuMemAlloc_(&d_km, (unsigned long long)heads * total * d * 4) ||
         cuMemAlloc_(&d_vm, (unsigned long long)heads * total * d * 4) ||
@@ -335,6 +347,8 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
         failed = 1;
     }
 
+    fprintf(stderr, "simtssd: launching (heads=%d n_ctx=%d d=%d)\n", heads,
+            n_ctx, d);
     if (!failed) {
         unsigned long long blocks =
             ((unsigned long long)total * heads * d + 255) / 256;
@@ -369,7 +383,7 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
          * output (numerically identical to the LSE merge). */
         unsigned long long obytes =
             (unsigned long long)heads * q_rows * d * 4;
-        uint8_t *h_ofinal = (uint8_t *)args->mr_addr[12];
+        uint8_t *h_ofinal = kv_base + r[12].addr;
         if (cuMemcpyDtoH_(h_ofinal, d_opart, obytes, 0, c->stream) != 0) {
             failed = 1;
         }
