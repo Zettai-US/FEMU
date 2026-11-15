@@ -20,6 +20,8 @@
 #include <dlfcn.h>
 #include <math.h>
 #include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +70,7 @@ typedef struct ssd_cuda {
     void *libcuda;
     void *libnvrtc;
     void *module;
+    void *ctx;
     void *fn_filter_merge;
     void *fn_matmul;
     void *fn_softmax;
@@ -114,9 +117,17 @@ static int cuda_init_locked(ssd_cuda_t *c) {
     }
     void *dev = NULL;
     void *ctx = NULL;
-    if (cuInit(0) || cuDeviceGet(&dev, 0) ||
-        cuDevicePrimaryCtxRetain(&ctx, dev) || cuCtxSetCurrent(ctx) ||
-        cuStreamCreate(&c->stream, 0)) {
+    int rc_init = cuInit(0);
+    int rc_dev = rc_init ? -1 : cuDeviceGet(&dev, 0);
+    int rc_ret = rc_dev ? -1 : cuDevicePrimaryCtxRetain(&ctx, dev);
+    int rc_set = rc_ret ? -1 : cuCtxSetCurrent(ctx);
+    c->ctx = ctx;
+    fprintf(stderr, "simtssd: init thread=%p retain=%d setcur=%d\n",
+            (void *)pthread_self(), rc_ret, rc_set);
+    int rc_str = rc_set ? -1 : cuStreamCreate(&c->stream, 0);
+    fprintf(stderr, "simtssd: cuInit=%d devGet=%d retain=%d setcur=%d "
+            "stream=%d\n", rc_init, rc_dev, rc_ret, rc_set, rc_str);
+    if (rc_init || rc_dev || rc_ret || rc_set || rc_str) {
         return -1;
     }
     void *prog = NULL;
@@ -124,9 +135,25 @@ static int cuda_init_locked(ssd_cuda_t *c) {
     char opt0[] = "--std=c++17";
     char opt1[] = "-arch=compute_80";
     char *opts[2] = {opt0, opt1};
-    if (nvrtcCreateProgram(&prog, g_simtssd_kernels_src, name, 0, NULL,
-                           NULL) ||
-        nvrtcCompileProgram(prog, 2, (const char **)opts)) {
+    int nrc = nvrtcCreateProgram(&prog, g_simtssd_kernels_src, name, 0, NULL,
+                                 NULL);
+    int crc = nrc ? -1 : nvrtcCompileProgram(prog, 2, (const char **)opts);
+    fprintf(stderr, "simtssd: nvrtc create=%d compile=%d\n", nrc, crc);
+    if (crc) {
+        unsigned long long log_size = 0;
+        int (*nvrtcGetProgramLogSize)(void *, unsigned long long *) =
+            dlsym(c->libnvrtc, "nvrtcGetProgramLogSize");
+        char *log = NULL;
+        int (*nvrtcGetProgramLog)(void *, char *) =
+            dlsym(c->libnvrtc, "nvrtcGetProgramLog");
+        if (nvrtcGetProgramLogSize) {
+            nvrtcGetProgramLogSize(prog, &log_size);
+            log = malloc(log_size ? log_size : 1);
+            if (log && nvrtcGetProgramLog) {
+                nvrtcGetProgramLog(prog, log);
+                fprintf(stderr, "simtssd nvrtc log: %s\n", log);
+            }
+        }
         return -1;
     }
     unsigned long long ptx_size = 0;
@@ -157,6 +184,9 @@ static void cuda_once(void) {
         g_cuda.libnvrtc = dlopen("libnvrtc.so", RTLD_NOW | RTLD_LOCAL);
     }
     if (!g_cuda.libcuda || !g_cuda.libnvrtc) {
+        fprintf(stderr, "simtssd: dlopen failed: libcuda=%p libnvrtc=%p "
+                "(%s / %s)\n", g_cuda.libcuda, g_cuda.libnvrtc,
+                dlerror() ? dlerror() : "?", dlerror() ? dlerror() : "?");
         g_init_rc = -1;
         return;
     }
@@ -177,37 +207,52 @@ __attribute__((constructor)) static void simtssd_plugin_ctor(void) {
 }
 
 
-static int launch1(ssd_cuda_t *c, void *fn, void **params,
-                   unsigned long long blocks) {
+static int launch1(ssd_cuda_t *c, void *fn, const char *name,
+                   void **params, unsigned long long blocks) {
     pfn_culaunch cuLaunchKernel =
         (pfn_culaunch)dlsym(c->libcuda, "cuLaunchKernel");
+    const char *errname = NULL;
+    int (*cuGetErrorName)(int, const char **) =
+        dlsym(c->libcuda, "cuGetErrorName");
     if (!cuLaunchKernel) {
         return -1;
     }
-    return cuLaunchKernel(fn, (unsigned)blocks, 1, 1, 256, 1, 1, 0, c->stream,
-                          params, NULL)
-               ? -1
-               : 0;
+    int rc = cuLaunchKernel(fn, (unsigned)blocks, 1, 1, 256, 1, 1, 0,
+                            c->stream, params, NULL);
+    if (rc && cuGetErrorName) {
+        cuGetErrorName(rc, &errname);
+        fprintf(stderr, "simtssd: launch %s failed: %s (blocks=%llu)\n",
+                name, errname ? errname : "?", blocks);
+    }
+    return rc ? -1 : 0;
 }
 
 static int stage_in(ssd_cuda_t *c, pfn_cualloc cuMemAlloc,
                     pfn_curet cuMemcpyHtoD, const void *host, uint64_t len,
                     void **dev) {
-    if (cuMemAlloc(dev, len ? len : 1) != 0) {
+    int arc = cuMemAlloc(dev, len ? len : 1);
+    if (arc != 0) {
+        const char *e = NULL;
+        int (*cuGetErrorName)(int, const char **) =
+            dlsym(c->libcuda, "cuGetErrorName");
+        if (cuGetErrorName) cuGetErrorName(arc, &e);
+        fprintf(stderr, "simtssd: stage alloc failed rc=%d (%s) len=%llu\n",
+                arc, e ? e : "?", (unsigned long long)len);
         return -1;
     }
     if (len && cuMemcpyHtoD(*dev, host, len, 0, c->stream) != 0) {
+        fprintf(stderr, "simtssd: stage H2D failed (len=%llu)\n",
+                (unsigned long long)len);
         return -1;
     }
     return 0;
 }
 
 int64_t simtssd_fused_main(FemuCsdArgs *args) {
-    cuda_lazy_init();
-    if (g_init_rc != 0) {
-        fprintf(stderr, "simtssd: cuda init failed (%d)\n", g_init_rc);
-        return -1;
-    }
+    /* CUDA runs in the forked compute child: a fresh process has none
+     * of the QEMU threading/locking context that cuInit inside the
+     * emulator process conflicts with. The child inherits the parsed
+     * operands; only O_final travels back over a pipe. */
     ssd_cuda_t *c = &g_cuda;
     pfn_cualloc cuMemAlloc_ =
         (pfn_cualloc)dlsym2(c->libcuda, "cuMemAlloc_v2", "cuMemAlloc");
@@ -227,6 +272,9 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
         return -1;
     }
 
+    fprintf(stderr, "simtssd: entry numr=%d cparam1=%lld cparam2=%lld\n",
+            args->numr, args->cparam1, args->cparam2);
+    fprintf(stderr, "simtssd: main thread=%p\n", (void *)pthread_self());
     int kv_mr = (int)args->cparam1;
     uint64_t desc_off = (uint64_t)args->cparam2;
     if (kv_mr < 0 || kv_mr >= args->numr || !args->mr_addr[kv_mr]) {
@@ -235,8 +283,10 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
         return -1;
     }
     uint8_t *kv_base = (uint8_t *)args->mr_addr[kv_mr];
+    fprintf(stderr, "simtssd: kv_base=%p\n", kv_base);
     ssd_range_t r[N_RANGES];
     memcpy(r, kv_base + desc_off, sizeof(r));
+    fprintf(stderr, "simtssd: descs ok r0.kind=%d\n", r[0].kind);
 
     /* Gather the pre K/V pages (PAGE_INDIRECT into the KV MRS, or a
      * contiguous window when the flag is absent). */
@@ -308,6 +358,53 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
         }
     }
 
+    uint64_t ofinal_bytes = (uint64_t)heads * q_rows * d * 4;
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        free(pos64);
+        free(kbuf);
+        free(vbuf);
+        return -1;
+    }
+    fflush(stderr);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* compute child: CUDA init + the fused flow; only O_final
+         * crosses back (768 bytes for the reference geometry). */
+        close(pipefd[0]);
+        cuda_lazy_init();
+        if (g_init_rc != 0) {
+            fprintf(stderr, "simtssd child: cuda init failed\n");
+            _exit(2);
+        }
+    } else if (pid > 0) {
+        /* parent: read O_final straight into the AFDM, reap, return */
+        close(pipefd[1]);
+        uint64_t ofinal_off = r[12].addr;
+        uint64_t got = 0;
+        while (got < ofinal_bytes) {
+            ssize_t n = read(pipefd[0], kv_base + ofinal_off + got,
+                             ofinal_bytes - got);
+            if (n <= 0) {
+                break;
+            }
+            got += (uint64_t)n;
+        }
+        close(pipefd[0]);
+        int st = 0;
+        waitpid(pid, &st, 0);
+        free(pos64);
+        free(kbuf);
+        free(vbuf);
+        if (got != ofinal_bytes) {
+            fprintf(stderr, "simtssd: child returned %llu/%llu bytes\n",
+                    (unsigned long long)got, (unsigned long long)ofinal_bytes);
+            return -1;
+        }
+        return 0;
+    }
+    /* in the child from here on */
+
     void *d_pre_k = NULL;
     void *d_pre_v = NULL;
     void *d_app_k = NULL;
@@ -362,33 +459,44 @@ int64_t simtssd_fused_main(FemuCsdArgs *args) {
         void *o2 = d_vm;
         void *params_v[] = {&a2, &d_app_v, &d_pos, &o2, &n_ctx, &hkvd, &nqq,
                             &heads, &d};
-        failed |= launch1(c, c->fn_filter_merge, params_k, blocks);
-        failed |= launch1(c, c->fn_filter_merge, params_v, blocks);
+        failed |= launch1(c, c->fn_filter_merge, "filter_k", params_k, blocks);
+        failed |= launch1(c, c->fn_filter_merge, "filter_v", params_v, blocks);
         unsigned long long sn = (unsigned long long)heads * q_rows * total;
         int tb = 1;
         void *params_s[] = {&d_q, &d_km, &d_scores, &heads, &q_rows, &d,
                             &total, &tb, &scale};
-        failed |= launch1(c, c->fn_matmul, params_s, (sn + 255) / 256);
+        failed |= launch1(c, c->fn_matmul, "scores", params_s, (sn + 255) / 256);
         void *params_m[] = {&d_scores, &d_mask, &d_probs, &heads, &q_rows,
                             &total};
-        failed |= launch1(c, c->fn_softmax, params_m,
+        failed |= launch1(c, c->fn_softmax, "softmax", params_m,
                           ((unsigned long long)heads * q_rows + 255) / 256);
         unsigned long long on = (unsigned long long)heads * q_rows * d;
         int tb0 = 0;
         float one = 1.0f;
         void *params_o[] = {&d_probs, &d_vm, &d_opart, &heads, &q_rows,
                             &total, &d, &tb0, &one};
-        failed |= launch1(c, c->fn_matmul, params_o, (on + 255) / 256);
+        failed |= launch1(c, c->fn_matmul, "ofinal", params_o, (on + 255) / 256);
         /* LSE reduce: normalized probs make the partial sum the final
-         * output (numerically identical to the LSE merge). */
-        unsigned long long obytes =
-            (unsigned long long)heads * q_rows * d * 4;
-        uint8_t *h_ofinal = kv_base + r[12].addr;
-        if (cuMemcpyDtoH_(h_ofinal, d_opart, obytes, 0, c->stream) != 0) {
-            failed = 1;
-        }
-        if (cuStreamSync(c->stream) != 0) {
-            failed = 1;
+         * output (numerically identical to the LSE merge). The result
+         * crosses the pipe to the parent, which owns the AFDM. */
+        {
+            unsigned long long obytes =
+                (unsigned long long)heads * q_rows * d * 4;
+            uint8_t *local = (uint8_t *)malloc(obytes);
+            if (!local ||
+                cuMemcpyDtoH_(local, d_opart, obytes, 0, c->stream) != 0) {
+                free(local);
+                _exit(3);
+            }
+            if (cuStreamSync(c->stream) != 0) {
+                free(local);
+                _exit(3);
+            }
+            if (write(pipefd[1], local, obytes) != (ssize_t)obytes) {
+                free(local);
+                _exit(3);
+            }
+            free(local);
         }
     }
 

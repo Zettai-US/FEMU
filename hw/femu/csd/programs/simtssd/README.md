@@ -50,9 +50,26 @@ Driver-ABI note (bring-up finding): CUDA memory entry points must use
 the `_v2` symbols (`cuMemAlloc_v2`, `cuMemcpyHtoDAsync_v2`, ...) — the
 undecorated names bind to the legacy-context entry points and fail
 with `CUDA_ERROR_INVALID_CONTEXT` (the plugin's `dlsym2` handles
-this). Known bring-up item: cuInit inside the QEMU process currently
-faults on first contact; the plugin is cross-validated in-process by
-the LMCache reference test (test_simtssd_csd_plugin.py).
+this).
+
+## Compute deployment: out-of-process GPU server
+
+cuInit inside the QEMU process conflicts with the emulator's own
+context/threading (observed as CUDA_ERROR_OUT_OF_MEMORY under GPU
+pressure from co-tenants and CUDA_ERROR_INVALID_CONTEXT on CSD
+workers). The supported deployment therefore runs CUDA in a separate
+daemon: `gpu_server.c` (same directory) NVRTC-compiles the shared
+kernels at startup and serves framed fused-attention requests over a
+UNIX socket (`SIMTSSD_GPU_SOCK`, default `/tmp/simtssd-gpu.sock`).
+The plugin gathers operands in the emulator (no CUDA there), ships
+them, and writes the returned O_final into the AFDM.
+
+    gcc -std=c11 -O2 -Wall -I. gpu_server.c -o gpu_server -ldl -lm -lpthread
+    ./gpu_server &            # before the first EXECUTE
+
+Both deployment shapes are validated in-process by the LMCache
+reference tests (test_simtssd_csd_plugin.py drives the plugin; the
+gpu-server request path is exercised by the same operand layout).
 
 The host side (LMCache `simtssd` L2 adapter) records the per-key page
 tables and issues the standard CSD/CP commands (COMPUTE LOAD /
